@@ -1,0 +1,28 @@
+name: AI Daily Digest
+
+on:
+  schedule:
+    # GitHub Actions schedule supports `timezone:` — locks to 9am ET year-round (DST handled).
+    # Moved off top-of-hour to :13 — GitHub docs warn that top-of-hour scheduled runs
+    # are the highest-delay/drop window for scheduled Actions under load.
+    - cron: '13 9 * * *'
+      timezone: 'America/New_York'
+  workflow_dispatch: {}  # manual trigger for testing
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - run: python run.py
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AGENT_ID: ${{ secrets.AGENT_ID }}
+          ENVIRONMENT_ID: ${{ secrets.ENVIRONMENT_ID }}
+          GIT_PAT: ${{ secrets.GIT_PAT }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
