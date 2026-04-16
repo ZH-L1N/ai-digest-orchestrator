@@ -1,11 +1,15 @@
 """Runtime orchestrator for the AI Daily Digest Managed Agent.
 
 Drives a single session:
-  1. Create session with the Obsidian vault mounted as a github_repository resource.
-  2. Stream events; handle send_slack_message custom tool; handle idle turns.
-  3. After the agent finishes, verify today's note is on main and matches the
-     agent's claimed CONTENT_SHA256 hash. Any mismatch -> SystemExit(1).
-  4. Always archive the session in finally.
+  1. Create session with the Obsidian vault mounted as a github_repository
+     resource (read-only; writes go through write_daily_note tool below).
+  2. Stream events; handle write_daily_note and send_slack_message custom tools;
+     handle idle turns.
+  3. On write_daily_note: verify the agent's claimed content SHA-256, then
+     commit the file to main via the GitHub REST API (orchestrator-side write).
+  4. After the agent finishes, verify the file on main matches the last
+     content_sha256 the agent supplied. Any mismatch -> SystemExit(1).
+  5. Always archive the session in finally.
 
 Env vars required (set by the GitHub Actions workflow):
     ANTHROPIC_API_KEY, AGENT_ID, ENVIRONMENT_ID, GIT_PAT, SLACK_WEBHOOK_URL
@@ -16,7 +20,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import sys
 import time
 import urllib.error
@@ -34,11 +37,8 @@ BRANCH = "main"
 
 GITHUB_API = "https://api.github.com"
 USER_AGENT = "ai-digest-orchestrator"
-HTTP_TIMEOUT = 10.0
-
-CONTENT_SHA256_RE = re.compile(
-    r"^CONTENT_SHA256:\s+([0-9a-fA-F]{64})\s*$", re.MULTILINE
-)
+HTTP_READ_TIMEOUT = 10.0
+HTTP_WRITE_TIMEOUT = 30.0
 
 log = logging.getLogger("run")
 
@@ -65,21 +65,19 @@ def _gh_headers(pat):
     }
 
 
-def _http_get_json(url, headers):
-    req = urllib.request.Request(url, headers=headers, method="GET")
+def _http_request(url, headers, method="GET", data=None, timeout=HTTP_READ_TIMEOUT):
+    req = urllib.request.Request(url, headers=headers, method=method, data=data)
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
-            status = r.status
-            body = r.read().decode("utf-8")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         return e.code, (e.read().decode("utf-8") if e.fp else "")
-    return status, body
 
 
 def github_get_contents(pat, path):
     """Return (sha, bytes) for path on main, or (None, None) if 404."""
     url = f"{GITHUB_API}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}?ref={BRANCH}"
-    status, body = _http_get_json(url, _gh_headers(pat))
+    status, body = _http_request(url, _gh_headers(pat))
     if status == 404:
         return None, None
     if not (200 <= status < 300):
@@ -87,32 +85,48 @@ def github_get_contents(pat, path):
     data = json.loads(body)
     sha = _get(data, "sha")
     b64 = _get(data, "content") or ""
-    # GitHub returns content base64-encoded with embedded newlines
     raw = base64.b64decode(b64) if b64 else b""
     return sha, raw
 
 
-def github_latest_commit_utc(pat, path):
-    """Return tz-aware UTC datetime of the most recent commit touching path."""
-    url = (
-        f"{GITHUB_API}/repos/{REPO_OWNER}/{REPO_NAME}/commits"
-        f"?path={path}&per_page=1&sha={BRANCH}"
+def github_put_contents(pat, path, content_bytes, commit_message, sha=None):
+    """Create or update a file on main via contents API.
+
+    Returns parsed response JSON on 2xx, or raises RuntimeError with detail.
+    """
+    url = f"{GITHUB_API}/repos/{REPO_OWNER}/{REPO_NAME}/contents/{path}"
+    body = {
+        "message": commit_message,
+        "content": base64.b64encode(content_bytes).decode("ascii"),
+        "branch": BRANCH,
+    }
+    if sha is not None:
+        body["sha"] = sha
+    headers = _gh_headers(pat)
+    headers["Content-Type"] = "application/json"
+    status, resp_body = _http_request(
+        url,
+        headers,
+        method="PUT",
+        data=json.dumps(body).encode("utf-8"),
+        timeout=HTTP_WRITE_TIMEOUT,
     )
-    status, body = _http_get_json(url, _gh_headers(pat))
     if not (200 <= status < 300):
-        raise RuntimeError(f"GitHub commits GET failed: {status} {body[:300]}")
-    commits = json.loads(body)
-    if not commits:
-        raise RuntimeError(f"no commits found for path {path!r}")
-    iso = commits[0]["commit"]["committer"]["date"].replace("Z", "+00:00")
-    return datetime.fromisoformat(iso)
+        raise RuntimeError(f"GitHub contents PUT failed: {status} {resp_body[:500]}")
+    return json.loads(resp_body)
 
 
-def post_slack(webhook_url, summary):
-    """POST with 2 retries (2s/4s backoff). Returns (ok, detail)."""
+def _webhook_tag(url):
+    """Short non-secret identifier for logging (last 6 chars of path)."""
+    return "…" + url[-6:] if len(url) > 6 else url
+
+
+def _post_slack_single(webhook_url, summary):
+    """POST to one webhook with 2 retries (2s/4s backoff). Returns (ok, detail)."""
     payload = json.dumps({"text": summary}).encode("utf-8")
-    delays = [0, 2.0, 4.0]  # first attempt, then two backoff retries
+    delays = [0, 2.0, 4.0]
     last_detail = "unknown"
+    tag = _webhook_tag(webhook_url)
     for i, delay in enumerate(delays):
         if delay:
             time.sleep(delay)
@@ -123,7 +137,7 @@ def post_slack(webhook_url, summary):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+            with urllib.request.urlopen(req, timeout=HTTP_READ_TIMEOUT) as r:
                 if 200 <= r.status < 300:
                     return True, f"status={r.status}"
                 last_detail = f"http {r.status}"
@@ -131,8 +145,37 @@ def post_slack(webhook_url, summary):
             last_detail = f"http {e.code}"
         except Exception as e:  # URLError, timeout, etc.
             last_detail = f"{type(e).__name__}: {e}"
-        log.warning("Slack attempt %d/%d failed: %s", i + 1, len(delays), last_detail)
+        log.warning(
+            "Slack %s attempt %d/%d failed: %s", tag, i + 1, len(delays), last_detail
+        )
     return False, last_detail
+
+
+def post_slack(webhook_spec, summary):
+    """POST to one or more Slack webhook URLs.
+
+    `webhook_spec` may be a single URL or a comma-separated list of URLs.
+    Strict: returns (True, ...) only if ALL destinations succeeded.
+    """
+    urls = [u.strip() for u in webhook_spec.split(",") if u.strip()]
+    if not urls:
+        return False, "no webhook URLs configured"
+
+    all_ok = True
+    details = []
+    for url in urls:
+        ok, detail = _post_slack_single(url, summary)
+        details.append(f"{_webhook_tag(url)}={detail}")
+        if not ok:
+            all_ok = False
+
+    log.info(
+        "Slack posted to %d destination(s): %s [%s]",
+        len(urls),
+        "all ok" if all_ok else "some failed",
+        "; ".join(details),
+    )
+    return all_ok, "; ".join(details)
 
 
 # --- Event processing -------------------------------------------------------
@@ -182,9 +225,59 @@ def backfill_custom_tool_uses(client, session_id, known):
         cursor = last_id
 
 
-def extract_content_hash(all_text):
-    matches = CONTENT_SHA256_RE.findall(all_text)
-    return matches[-1].lower() if matches else None
+def handle_write_daily_note(git_pat, path, date_str, tool_input, before_sha):
+    """Verify hash, commit via GitHub contents API. Returns (result_dict, is_error, claimed_sha)."""
+    content = tool_input.get("content")
+    claimed = (tool_input.get("content_sha256") or "").lower()
+
+    if not isinstance(content, str):
+        return {"committed": False, "error": "content must be a string"}, True, None
+    if not isinstance(claimed, str) or len(claimed) != 64:
+        return (
+            {"committed": False, "error": "content_sha256 must be 64 hex chars"},
+            True,
+            None,
+        )
+
+    content_bytes = content.encode("utf-8")
+    computed = hashlib.sha256(content_bytes).hexdigest()
+    if computed != claimed:
+        return (
+            {
+                "committed": False,
+                "error": f"hash mismatch: claimed={claimed} computed={computed}",
+            },
+            True,
+            None,
+        )
+
+    # Re-fetch current state at call time (before_sha was captured at run start;
+    # the file may have changed if this is a same-session retry after a no-op).
+    current_sha, current_bytes = github_get_contents(git_pat, path)
+    if current_sha is not None and current_bytes == content_bytes:
+        log.info("write_daily_note: content byte-identical to main; no-op")
+        return {"committed": False, "no_op": True}, False, claimed
+
+    commit_message = f"Daily digest {date_str}"
+    try:
+        resp = github_put_contents(
+            git_pat,
+            path,
+            content_bytes,
+            commit_message,
+            sha=current_sha,
+        )
+    except Exception as e:
+        log.error("github_put_contents failed: %s", e)
+        return {"committed": False, "error": str(e)}, True, None
+
+    commit_sha = _get(_get(resp, "commit") or {}, "sha")
+    log.info("write_daily_note: committed %s commit_sha=%s", path, commit_sha)
+    return (
+        {"committed": True, "commit_sha": commit_sha, "no_op": False},
+        False,
+        claimed,
+    )
 
 
 def run_session(client, *, agent_id, env_id, git_pat, slack_webhook_url):
@@ -246,18 +339,22 @@ def _drive_session(
 ):
     slack_sent = False
     slack_error = None
+    note_committed = False
+    last_claimed_sha = None
     pending_custom_tool_uses = set()
     answered_custom_tool_uses = set()
-    mcp_errors_seen = []
-    agent_message_texts = []
 
     kickoff = (
         f"Today's date (America/New_York): {date_str}\n"
         f"Target file path (must use exactly this path): {path}\n"
         f"Branch: {BRANCH}\n"
-        f"Fetch the last 24 hours of AI news, write today's digest to {path} in the "
-        "Obsidian vault via the GitHub MCP tools, and send the Slack summary. "
-        "End your final message with CONTENT_SHA256: <sha256 hex of the file's UTF-8 bytes>."
+        f"Fetch the last 24 hours of AI news, compose today's digest markdown, "
+        f"call write_daily_note with the full content and its SHA-256 hash "
+        f"(the orchestrator will commit it to {path} on main for you), then "
+        f"call send_slack_message with a short bullet summary. "
+        f"Reminder: do NOT try to git push or write to the mount from bash — "
+        f"you don't have credentials and it will fail. The only write path is "
+        f"the write_daily_note tool."
     )
 
     with client.beta.sessions.events.stream(session_id) as stream:
@@ -276,26 +373,58 @@ def _drive_session(
             if et == "agent.message":
                 text = _extract_message_text(event)
                 if text:
-                    agent_message_texts.append(text)
                     log.info("agent.message: %s", text[:200].replace("\n", " "))
-            elif et == "agent.mcp_tool_result":
-                if _get(event, "is_error"):
-                    mcp_errors_seen.append(
-                        {
-                            "tool_use_id": _get(event, "tool_use_id"),
-                            "content": _get(event, "content"),
-                        }
-                    )
-                    log.warning("mcp tool result is_error=true: %s", event)
             elif et == "session.error":
                 log.error("session.error: %s", event)
                 raise SystemExit(1)
             elif et == "agent.custom_tool_use":
                 tool_name = _get(event, "name")
                 tool_use_id = _get(event, "id")
-                if tool_name != "send_slack_message":
+                pending_custom_tool_uses.add(tool_use_id)
+                tool_input = _extract_tool_input(event)
+
+                if tool_name == "write_daily_note":
+                    result, is_error, claimed = handle_write_daily_note(
+                        git_pat, path, date_str, tool_input, before_sha
+                    )
+                    if not is_error:
+                        note_committed = True
+                        last_claimed_sha = claimed
+                    send_custom_tool_result(
+                        client,
+                        session_id,
+                        tool_use_id,
+                        json.dumps(result),
+                        is_error,
+                    )
+
+                elif tool_name == "send_slack_message":
+                    summary = tool_input.get("summary", "")
+                    if not summary:
+                        log.warning("send_slack_message called with empty summary")
+                    ok, detail = post_slack(
+                        slack_webhook_url, summary or "(empty summary)"
+                    )
+                    if ok:
+                        slack_sent = True
+                        send_custom_tool_result(
+                            client, session_id, tool_use_id, "sent", False
+                        )
+                    else:
+                        slack_error = detail
+                        send_custom_tool_result(
+                            client,
+                            session_id,
+                            tool_use_id,
+                            f"slack post failed: {detail}",
+                            True,
+                        )
+
+                else:
                     log.warning(
-                        "unexpected custom_tool_use name=%r id=%s", tool_name, tool_use_id
+                        "unexpected custom_tool_use name=%r id=%s",
+                        tool_name,
+                        tool_use_id,
                     )
                     send_custom_tool_result(
                         client,
@@ -304,30 +433,7 @@ def _drive_session(
                         f"unknown tool {tool_name!r}",
                         True,
                     )
-                    pending_custom_tool_uses.discard(tool_use_id)
-                    answered_custom_tool_uses.add(tool_use_id)
-                    continue
 
-                pending_custom_tool_uses.add(tool_use_id)
-                summary = _extract_tool_input(event).get("summary", "")
-                if not summary:
-                    log.warning("send_slack_message called with empty summary")
-
-                ok, detail = post_slack(slack_webhook_url, summary or "(empty summary)")
-                if ok:
-                    slack_sent = True
-                    send_custom_tool_result(
-                        client, session_id, tool_use_id, "sent", False
-                    )
-                else:
-                    slack_error = detail
-                    send_custom_tool_result(
-                        client,
-                        session_id,
-                        tool_use_id,
-                        f"slack post failed: {detail}",
-                        True,
-                    )
                 pending_custom_tool_uses.discard(tool_use_id)
                 answered_custom_tool_uses.add(tool_use_id)
 
@@ -346,55 +452,37 @@ def _drive_session(
 
     # --- Post-loop verification ---------------------------------------------
 
+    if not note_committed:
+        log.error("write_daily_note never succeeded; note was not committed")
+        raise SystemExit(1)
     if not slack_sent:
         log.error("slack was never sent successfully; last error=%s", slack_error)
         raise SystemExit(1)
-
-    all_text = "\n".join(agent_message_texts)
-    agent_claimed_hash = extract_content_hash(all_text)
-    if agent_claimed_hash is None:
-        log.error("agent did not emit CONTENT_SHA256 line; contract broken")
+    if last_claimed_sha is None:
+        log.error("internal: note_committed=True but last_claimed_sha is None")
         raise SystemExit(1)
 
+    # Belt-and-suspenders: confirm what's on main matches what we thought we wrote.
     after_sha, observed_bytes = github_get_contents(git_pat, path)
     if after_sha is None:
-        log.error(
-            "post-run: file %s does not exist on main; mcp_errors_seen=%s",
-            path,
-            mcp_errors_seen,
-        )
+        log.error("post-run: file %s unexpectedly missing on main", path)
         raise SystemExit(1)
-
     observed_hash = hashlib.sha256(observed_bytes).hexdigest()
-    latest_commit_utc = github_latest_commit_utc(git_pat, path)
-
-    rule2 = observed_hash == agent_claimed_hash
-    rule3 = (latest_commit_utc >= run_start_utc) or (
-        before_sha is not None and before_sha == after_sha
-    )
-
-    if not (rule2 and rule3):
+    if observed_hash != last_claimed_sha:
         log.error(
-            "verification failed: "
-            "agent_claimed_hash=%s observed_hash=%s "
-            "before_sha=%s after_sha=%s "
-            "latest_commit_utc=%s run_start_utc=%s "
-            "mcp_errors_seen=%s",
-            agent_claimed_hash,
+            "post-run hash mismatch: observed=%s expected=%s path=%s after_sha=%s",
             observed_hash,
-            before_sha,
+            last_claimed_sha,
+            path,
             after_sha,
-            latest_commit_utc.isoformat(),
-            run_start_utc.isoformat(),
-            mcp_errors_seen,
         )
         raise SystemExit(1)
 
     log.info(
-        "success: hash_match=%s committed_this_run=%s unchanged_noop=%s",
-        rule2,
-        latest_commit_utc >= run_start_utc,
-        before_sha is not None and before_sha == after_sha,
+        "success: path=%s after_sha=%s content_sha256=%s",
+        path,
+        after_sha,
+        observed_hash,
     )
 
 

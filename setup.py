@@ -21,7 +21,6 @@ import anthropic
 ENV_NAME = "ai-digest-env"
 AGENT_NAME = "AI Daily Digest"
 MODEL = "claude-sonnet-4-6"
-GITHUB_MCP_URL = "https://api.githubcopilot.com/mcp/"
 
 SYSTEM_PROMPT = """\
 You are an AI news curator. Your job is to find the most important AI news from the last 24 hours and produce two outputs:
@@ -47,14 +46,19 @@ You are an AI news curator. Your job is to find the most important AI news from 
 - Funding/hiring news unless it directly affects a product
 
 ## Workflow
-1. Use web_search to find recent AI news from each source category
-2. Use web_fetch to get details from relevant articles
-3. Compose the markdown daily note content in memory (target path: `YYYY/MM/YYYY-MM-DD.md` in the `ai-daily-digest` repo on `main`)
-4. Use the GitHub MCP tools (exposed via `mcp_toolset`, server name `github`) to commit and push the file. Do NOT use bash+git for writes. You may read the mounted repo at `/workspace/ai-daily-digest` with `read`/`bash` to check whether today's file already exists. (Structural enforcement: GIT_PAT is only attached to the session's `github_repository` resource and the GitHub MCP server; it is not exposed as a sandbox env var, so plain `git push` from bash will fail on auth even if attempted.)
-   - If file doesn't exist: create it via the MCP `create_or_update_file`-style tool with commit message `Daily digest YYYY-MM-DD`
-   - If file exists (same-day rerun): update it via the same tool with the fresh content; skip the write entirely if the new content is byte-identical to the existing content (avoid empty commits)
-5. Call send_slack_message with a short bullet-point summary. Always fire - even on same-day reruns and even when no commit was produced (byte-identical no-op). Duplicate Slack messages on reruns are allowed by design.
-6. In your final message, always include a single line of the form `CONTENT_SHA256: <64-hex-chars>` computed over the UTF-8 bytes of today's intended note content (exactly what you wrote, or would have written for a no-op). The orchestrator independently fetches today's file from GitHub, computes its SHA-256, and compares. No free-form sentinels; the hash is the contract.
+1. Use web_search to find recent AI news from each source category.
+2. Use web_fetch to get details from relevant articles.
+3. (Optional) Read the mounted repo at `/workspace/ai-daily-digest` via `read`/`bash` to see yesterday's note or check whether today's file already exists. READ ONLY - do not attempt to write or git push from bash, you lack credentials for that.
+4. Compose the full markdown daily note content in memory, following the Daily note format below.
+5. Compute the SHA-256 of the UTF-8-encoded content. A reliable bash recipe:
+     printf '%s' "<your exact content>" | sha256sum
+   (or use Python via bash: `python3 -c "import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())" <<< "<content>"`)
+   Whatever you pass as `content` to the tool MUST be the same bytes you hashed.
+6. Call `write_daily_note` with input `{"content": "<full markdown>", "content_sha256": "<64-hex>"}`. The orchestrator will verify the hash, then commit the file at YYYY/MM/YYYY-MM-DD.md on main via the GitHub REST API. It returns one of:
+   - `{"committed": true, "commit_sha": "...", "no_op": false}` - real commit happened
+   - `{"committed": false, "no_op": true}` - today's file was already byte-identical, commit skipped (still counts as success)
+   - `{"committed": false, "error": "..."}` with is_error=true - hash mismatch or API error; you may retry once with a recomputed hash
+7. Call `send_slack_message` with a short bullet-point summary. Always fire - even on no-op reruns. Duplicate Slack messages on reruns are allowed by design.
 
 ## Daily note format
 ---
@@ -93,10 +97,43 @@ AGENT_TOOLSET = {
     ],
 }
 
-MCP_TOOLSET = {
-    "type": "mcp_toolset",
-    "mcp_server_name": "github",
-    "default_config": {"permission_policy": {"type": "always_allow"}},
+WRITE_DAILY_NOTE_TOOL = {
+    "type": "custom",
+    "name": "write_daily_note",
+    "description": (
+        "Commit today's daily digest markdown to the Obsidian vault on the main "
+        "branch. The orchestrator handles the actual GitHub REST API write. You "
+        "supply the full markdown content AND its SHA-256 hash (of the UTF-8 "
+        "bytes). The orchestrator verifies the hash matches the content it "
+        "received, then creates or updates YYYY/MM/YYYY-MM-DD.md on main. "
+        "Returns one of: {committed: true, commit_sha, no_op: false} on a real "
+        "commit; {committed: false, no_op: true} if today's file was already "
+        "byte-identical; or is_error=true with {error: ...} on hash mismatch "
+        "or network failure. Call this exactly once per run, before "
+        "send_slack_message. If it returns is_error, you may retry once with a "
+        "recomputed hash."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": (
+                    "The complete markdown body of today's daily digest. The "
+                    "orchestrator writes these exact UTF-8 bytes to main."
+                ),
+            },
+            "content_sha256": {
+                "type": "string",
+                "description": (
+                    "The SHA-256 hex digest (64 lowercase hex chars) of the "
+                    "UTF-8 bytes of `content`. Computed by you and verified by "
+                    "the orchestrator before any write is attempted."
+                ),
+            },
+        },
+        "required": ["content", "content_sha256"],
+    },
 }
 
 SLACK_CUSTOM_TOOL = {
@@ -104,8 +141,8 @@ SLACK_CUSTOM_TOOL = {
     "name": "send_slack_message",
     "description": (
         "Send a short bullet-point summary of today's AI news digest to the team "
-        "Slack channel. Call this exactly once per run, after the daily note has "
-        "been committed to the Obsidian vault. The orchestrator posts the summary "
+        "Slack channel. Call this exactly once per run, after write_daily_note "
+        "has returned a non-error result. The orchestrator posts the summary "
         "verbatim to a Slack webhook - keep it scannable, one bullet per major "
         "item, with links."
     ),
@@ -120,8 +157,6 @@ SLACK_CUSTOM_TOOL = {
         "required": ["summary"],
     },
 }
-
-MCP_SERVER = {"type": "url", "name": "github", "url": GITHUB_MCP_URL}
 
 
 # --- Shape-tolerant helpers (see plan) -------------------------------------
@@ -148,6 +183,25 @@ def _model_id(m):
 
 def _sorted_if_list(v):
     return sorted(v) if isinstance(v, list) else v
+
+
+def _as_items(obj):
+    """Return list of (key, value) pairs from a dict, pydantic model, or None.
+
+    The Anthropic SDK returns pydantic models (e.g. BetaPackages) where dict
+    access would fail. Normalize both shapes to plain items.
+    """
+    if obj is None:
+        return []
+    if isinstance(obj, dict):
+        return list(obj.items())
+    dump = getattr(obj, "model_dump", None)  # pydantic v2
+    if callable(dump):
+        return list(dump(exclude_none=True).items())
+    dump = getattr(obj, "dict", None)  # pydantic v1
+    if callable(dump):
+        return list(dump(exclude_none=True).items())
+    return []
 
 
 # --- Canonicalization -------------------------------------------------------
@@ -213,16 +267,14 @@ def canonical_agent(a):
 
 
 def canonical_env(e):
-    cfg = _get(e, "config") or {}
-    net = _get(cfg, "networking") or {}
+    cfg = _get(e, "config")
+    net = _get(cfg, "networking")
+    allowed = _get(net, "allowed_hosts")
     return {
         "config.type": _get(cfg, "type"),
         "networking.type": _get(net, "type"),
-        "allowed_hosts": _sorted_if_list(_get(net, "allowed_hosts", []) or []),
-        "packages": {
-            k: _sorted_if_list(v)
-            for k, v in (_get(cfg, "packages", {}) or {}).items()
-        },
+        "allowed_hosts": _sorted_if_list(allowed) if isinstance(allowed, list) else [],
+        "packages": {k: _sorted_if_list(v) for k, v in _as_items(_get(cfg, "packages"))},
     }
 
 
@@ -258,8 +310,8 @@ def intended_agent():
             {
                 "model": MODEL,
                 "system": SYSTEM_PROMPT,
-                "mcp_servers": [MCP_SERVER],
-                "tools": [AGENT_TOOLSET, MCP_TOOLSET, SLACK_CUSTOM_TOOL],
+                "mcp_servers": [],
+                "tools": [AGENT_TOOLSET, WRITE_DAILY_NOTE_TOOL, SLACK_CUSTOM_TOOL],
             },
         )
     )
@@ -432,8 +484,7 @@ def ensure_agent(client, log, *, force, prune):
         name=AGENT_NAME,
         model=MODEL,
         system=SYSTEM_PROMPT,
-        mcp_servers=[MCP_SERVER],
-        tools=[AGENT_TOOLSET, MCP_TOOLSET, SLACK_CUSTOM_TOOL],
+        tools=[AGENT_TOOLSET, WRITE_DAILY_NOTE_TOOL, SLACK_CUSTOM_TOOL],
     )
     aid = _get(agent, "id")
     log.info("created agent: %s", aid)
