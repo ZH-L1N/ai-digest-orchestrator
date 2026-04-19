@@ -2,10 +2,10 @@ name: AI Daily Digest
 
 on:
   schedule:
-    # GitHub Actions schedule supports `timezone:` — locks to 9am ET year-round (DST handled).
+    # GitHub Actions schedule supports `timezone:` — locks to 7am ET year-round (DST handled).
     # Moved off top-of-hour to :13 — GitHub docs warn that top-of-hour scheduled runs
     # are the highest-delay/drop window for scheduled Actions under load.
-    - cron: '13 9 * * *'
+    - cron: '13 7 * * *'
       timezone: 'America/New_York'
   workflow_dispatch: {}  # manual trigger for testing
 

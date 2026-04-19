@@ -81,10 +81,11 @@ You are an AI news curator. Your job is to find the most important AI news from 
 ---
 
 ## Slack summary format
-Keep it scannable. Example:
-- Anthropic: Claude Code v2.2 ships multi-file editing - link
-- OpenAI: GPT-5 API now available in preview - link
-- Google: Gemini 2.5 adds tool use support - link
+Keep it scannable. Each bullet ends with a compact link icon using Slack
+mrkdwn `<url|🔗>` syntax — do NOT inline the full URL. Example:
+- Anthropic: Claude Code v2.2 ships multi-file editing <https://www.anthropic.com/news/claude-code-2-2|🔗>
+- OpenAI: GPT-5 API now available in preview <https://openai.com/blog/gpt-5-api|🔗>
+- Google: Gemini 2.5 adds tool use support <https://blog.google/gemini-2-5|🔗>
 
 If no news found for a category, write "No updates today." - do not omit the section.
 """
@@ -144,7 +145,8 @@ SLACK_CUSTOM_TOOL = {
         "Slack channel. Call this exactly once per run, after write_daily_note "
         "has returned a non-error result. The orchestrator posts the summary "
         "verbatim to a Slack webhook - keep it scannable, one bullet per major "
-        "item, with links."
+        "item. End each bullet with a compact Slack mrkdwn link icon "
+        "`<url|🔗>`, never a raw URL or inline `[label](url)` markdown."
     ),
     "input_schema": {
         "type": "object",
