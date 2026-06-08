@@ -1,0 +1,11 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Local secrets / env
+.env
+.env.*
+!.env.example
+
+# Adversarial-review + workflow scratch
+.scratch/

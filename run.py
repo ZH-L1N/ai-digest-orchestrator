@@ -3,8 +3,8 @@
 Drives a single session:
   1. Create session with the Obsidian vault mounted as a github_repository
      resource (read-only; writes go through write_daily_note tool below).
-  2. Stream events; handle write_daily_note and send_slack_message custom tools;
-     handle idle turns.
+  2. Stream events; handle write_daily_note, send_slack_message, and
+     send_audio_broadcast custom tools; handle idle turns.
   3. On write_daily_note: verify the agent's claimed content SHA-256, then
      commit the file to main via the GitHub REST API (orchestrator-side write).
   4. After the agent finishes, verify the file on main matches the last
@@ -13,6 +13,9 @@ Drives a single session:
 
 Env vars required (set by the GitHub Actions workflow):
     ANTHROPIC_API_KEY, AGENT_ID, ENVIRONMENT_ID, GIT_PAT, SLACK_WEBHOOK_URL
+Optional (audio broadcast — a SOFT feature; if any is unset, audio is skipped and
+the run still succeeds on the note + text):
+    OPENAI_API_KEY, SLACK_BOT_TOKEN, SLACK_CHANNEL_ID
 """
 
 import base64
@@ -20,9 +23,14 @@ import hashlib
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -39,6 +47,18 @@ GITHUB_API = "https://api.github.com"
 USER_AGENT = "ai-digest-orchestrator"
 HTTP_READ_TIMEOUT = 10.0
 HTTP_WRITE_TIMEOUT = 30.0
+
+# --- Audio (OpenAI TTS) ------------------------------------------------------
+OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech"
+TTS_MODEL = "gpt-4o-mini-tts"
+TTS_VOICE = "marin"
+TTS_INSTRUCTIONS = (
+    "Warm, calm morning news-anchor. Clear, measured pacing, confident but "
+    "relaxed, with slight upbeat energy at the open."
+)
+TTS_MAX_CHARS = 4000  # OpenAI /v1/audio/speech hard limit is 4096; leave margin.
+HTTP_TTS_TIMEOUT = 60.0
+SLACK_API = "https://slack.com/api"
 
 log = logging.getLogger("run")
 
@@ -280,7 +300,251 @@ def handle_write_daily_note(git_pat, path, date_str, tool_input, before_sha):
     )
 
 
-def run_session(client, *, agent_id, env_id, git_pat, slack_webhook_url):
+def _split_for_tts(text, max_chars=TTS_MAX_CHARS):
+    """Split text into <=max_chars chunks on sentence boundaries.
+
+    Falls back to hard-splitting any single sentence longer than max_chars so
+    no chunk ever exceeds the OpenAI /v1/audio/speech 4096-char input cap.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+    sentences = re.findall(r"[^.!?\n]+[.!?]?\s*", text)
+    chunks, cur = [], ""
+    for s in sentences:
+        if len(s) > max_chars:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            for i in range(0, len(s), max_chars):
+                chunks.append(s[i:i + max_chars])
+            continue
+        if len(cur) + len(s) <= max_chars:
+            cur += s
+        else:
+            if cur:
+                chunks.append(cur)
+            cur = s
+    if cur.strip():
+        chunks.append(cur)
+    return [c.strip() for c in chunks if c.strip()]
+
+
+def _tts_one(api_key, text):
+    """Synthesize one <=4096-char chunk. Returns (ok, mp3_bytes_or_None, detail)."""
+    payload = json.dumps(
+        {
+            "model": TTS_MODEL,
+            "input": text,
+            "voice": TTS_VOICE,
+            "instructions": TTS_INSTRUCTIONS,
+            "response_format": "mp3",
+        }
+    ).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    delays = [0, 2.0, 4.0]
+    last = "unknown"
+    for i, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        req = urllib.request.Request(
+            OPENAI_TTS_URL, data=payload, headers=headers, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TTS_TIMEOUT) as r:
+                if 200 <= r.status < 300:
+                    return True, r.read(), f"status={r.status}"
+                last = f"http {r.status}"
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace") if e.fp else ""
+            last = f"http {e.code}: {body[:200]}"
+        except Exception as e:  # URLError, timeout, etc.
+            last = f"{type(e).__name__}: {e}"
+        log.warning("TTS attempt %d/%d failed: %s", i + 1, len(delays), last)
+    return False, None, last
+
+
+def _concat_mp3(parts):
+    """Concatenate MP3 segments into one playable file. Returns (mp3_bytes, method).
+
+    Single segment -> returned as-is. Multiple segments -> ffmpeg stream-copy remux
+    (preinstalled on ubuntu-latest) for a clean container that seeks correctly and
+    doesn't truncate in Slack's player. If ffmpeg is unavailable (e.g. local Windows
+    dev) or fails, fall back to raw byte-join.
+    """
+    if len(parts) == 1:
+        return parts[0], "single"
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                seg_paths = []
+                for i, p in enumerate(parts):
+                    sp = os.path.join(td, f"seg{i:03d}.mp3")
+                    with open(sp, "wb") as f:
+                        f.write(p)
+                    seg_paths.append(sp)
+                list_path = os.path.join(td, "list.txt")
+                with open(list_path, "w", encoding="utf-8") as f:
+                    for sp in seg_paths:
+                        # ffmpeg concat demuxer: escape backslashes for Windows paths.
+                        f.write("file '%s'\n" % sp.replace("\\", "\\\\"))
+                out_path = os.path.join(td, "out.mp3")
+                proc = subprocess.run(
+                    [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+                     "-c", "copy", out_path],
+                    capture_output=True,
+                )
+                if proc.returncode == 0 and os.path.exists(out_path):
+                    with open(out_path, "rb") as f:
+                        return f.read(), "ffmpeg"
+                log.warning(
+                    "ffmpeg concat failed (rc=%s): %s; falling back to byte-join",
+                    proc.returncode,
+                    proc.stderr.decode("utf-8", "replace")[:200],
+                )
+        except Exception as e:  # disk full / perms / subprocess spawn — never fatal
+            log.warning("ffmpeg concat raised (%s); falling back to byte-join", e)
+    return b"".join(parts), "byte-join"
+
+
+def synthesize_tts(api_key, script):
+    """Turn a spoken script into MP3 bytes (chunked + concatenated).
+
+    Returns (ok, mp3_bytes_or_None, detail).
+    """
+    chunks = _split_for_tts(script)
+    if not chunks:
+        return False, None, "empty script"
+    parts = []
+    for idx, chunk in enumerate(chunks):
+        ok, mp3, detail = _tts_one(api_key, chunk)
+        if not ok:
+            return False, None, f"chunk {idx + 1}/{len(chunks)}: {detail}"
+        parts.append(mp3)
+    audio, method = _concat_mp3(parts)
+    return True, audio, f"{len(chunks)} chunk(s), concat={method}"
+
+
+def _slack_api_post(method, bot_token, form):
+    """POST a form-encoded Slack Web API call. Returns parsed JSON, raises on ok=false."""
+    url = f"{SLACK_API}/{method}"
+    data = urllib.parse.urlencode(form).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {bot_token}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": USER_AGENT,
+    }
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=HTTP_WRITE_TIMEOUT) as r:
+        body = json.loads(r.read().decode("utf-8"))
+    if not body.get("ok"):
+        raise RuntimeError(f"slack {method} error: {body.get('error')}")
+    return body
+
+
+def slack_upload_audio(bot_token, channel_id, mp3_bytes, filename, title, comment):
+    """Upload an MP3 to a Slack channel via the external-upload flow.
+
+    Returns (ok, detail). Three steps: reserve URL -> POST bytes -> complete+share.
+    """
+    try:
+        info = _slack_api_post(
+            "files.getUploadURLExternal",
+            bot_token,
+            {"filename": filename, "length": str(len(mp3_bytes))},
+        )
+        upload_url = info["upload_url"]
+        file_id = info["file_id"]
+
+        put = urllib.request.Request(
+            upload_url,
+            data=mp3_bytes,
+            headers={"Content-Type": "audio/mpeg", "User-Agent": USER_AGENT},
+            method="POST",
+        )
+        with urllib.request.urlopen(put, timeout=HTTP_WRITE_TIMEOUT) as r:
+            if not (200 <= r.status < 300):
+                return False, f"upload POST status {r.status}"
+
+        _slack_api_post(
+            "files.completeUploadExternal",
+            bot_token,
+            {
+                "files": json.dumps([{"id": file_id, "title": title}]),
+                "channel_id": channel_id,
+                "initial_comment": comment,
+            },
+        )
+        return True, f"file_id={file_id}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def handle_send_audio_broadcast(openai_key, bot_token, channel_id, date_str, tool_input):
+    """Synthesize the spoken script and upload it to Slack. Returns (result, is_error).
+
+    Audio is a SOFT feature: if any audio secret is unset, return a soft error
+    (is_error=True) instead of raising, so the run still succeeds on the note + text.
+    """
+    missing = [
+        name
+        for name, val in (
+            ("OPENAI_API_KEY", openai_key),
+            ("SLACK_BOT_TOKEN", bot_token),
+            ("SLACK_CHANNEL_ID", channel_id),
+        )
+        if not val
+    ]
+    if missing:
+        return {"sent": False, "error": f"audio disabled: missing {', '.join(missing)}"}, True
+
+    script = tool_input.get("script")
+    if not isinstance(script, str) or not script.strip():
+        return {"sent": False, "error": "script must be a non-empty string"}, True
+
+    # Audio is soft: nothing below may raise out of this function. Any unexpected
+    # error (TTS, concat file I/O, subprocess, Slack) becomes a soft is_error result.
+    try:
+        ok, mp3, detail = synthesize_tts(openai_key, script)
+        if not ok:
+            return {"sent": False, "error": f"tts failed: {detail}"}, True
+
+        filename = f"ai-daily-digest-{date_str}.mp3"
+        title = f"AI Daily Digest — {date_str}"
+        comment = f":headphones: Your AI morning brief for {date_str}"
+        up_ok, up_detail = slack_upload_audio(
+            bot_token, channel_id, mp3, filename, title, comment
+        )
+        if not up_ok:
+            return {"sent": False, "error": f"slack upload failed: {up_detail}"}, True
+    except Exception as e:
+        log.warning("audio broadcast errored (soft, run unaffected): %s", e)
+        return {"sent": False, "error": f"audio error: {type(e).__name__}: {e}"}, True
+
+    log.info(
+        "audio broadcast uploaded: %s (%d bytes, %s)", filename, len(mp3), detail
+    )
+    return {"sent": True, "bytes": len(mp3)}, False
+
+
+def run_session(
+    client,
+    *,
+    agent_id,
+    env_id,
+    git_pat,
+    slack_webhook_url,
+    openai_key,
+    slack_bot_token,
+    slack_channel_id,
+):
     # Compute today's path once, in ET, before any session work.
     now_et = datetime.now(ZoneInfo("America/New_York"))
     date_str = now_et.strftime("%Y-%m-%d")
@@ -317,6 +581,9 @@ def run_session(client, *, agent_id, env_id, git_pat, slack_webhook_url):
             run_start_utc=run_start_utc,
             git_pat=git_pat,
             slack_webhook_url=slack_webhook_url,
+            openai_key=openai_key,
+            slack_bot_token=slack_bot_token,
+            slack_channel_id=slack_channel_id,
         )
     finally:
         try:
@@ -336,9 +603,14 @@ def _drive_session(
     run_start_utc,
     git_pat,
     slack_webhook_url,
+    openai_key,
+    slack_bot_token,
+    slack_channel_id,
 ):
     slack_sent = False
     slack_error = None
+    audio_sent = False
+    audio_error = None
     note_committed = False
     last_claimed_sha = None
     pending_custom_tool_uses = set()
@@ -420,6 +692,26 @@ def _drive_session(
                             True,
                         )
 
+                elif tool_name == "send_audio_broadcast":
+                    result, is_error = handle_send_audio_broadcast(
+                        openai_key,
+                        slack_bot_token,
+                        slack_channel_id,
+                        date_str,
+                        tool_input,
+                    )
+                    if not is_error:
+                        audio_sent = True
+                    else:
+                        audio_error = result.get("error")
+                    send_custom_tool_result(
+                        client,
+                        session_id,
+                        tool_use_id,
+                        json.dumps(result),
+                        is_error,
+                    )
+
                 else:
                     log.warning(
                         "unexpected custom_tool_use name=%r id=%s",
@@ -458,6 +750,22 @@ def _drive_session(
     if not slack_sent:
         log.error("slack was never sent successfully; last error=%s", slack_error)
         raise SystemExit(1)
+    if not audio_sent:
+        log.warning(
+            "audio broadcast not sent (soft failure, run still succeeds); last error=%s",
+            audio_error,
+        )
+        # Surface the miss in the Slack text channel so a silently-failing flagship
+        # feature (e.g. agent skipped the tool, or a stale AGENT_ID lacks it) is visible.
+        # Best-effort; never fail the run on this.
+        try:
+            post_slack(
+                slack_webhook_url,
+                f":warning: Audio brief was not delivered today ({audio_error}). "
+                f"The written digest above is unaffected.",
+            )
+        except Exception as e:
+            log.warning("could not post audio-miss warning to Slack: %s", e)
     if last_claimed_sha is None:
         log.error("internal: note_committed=True but last_claimed_sha is None")
         raise SystemExit(1)
@@ -581,6 +889,9 @@ def main():
         env_id=os.environ["ENVIRONMENT_ID"],
         git_pat=os.environ["GIT_PAT"],
         slack_webhook_url=os.environ["SLACK_WEBHOOK_URL"],
+        openai_key=os.environ.get("OPENAI_API_KEY"),
+        slack_bot_token=os.environ.get("SLACK_BOT_TOKEN"),
+        slack_channel_id=os.environ.get("SLACK_CHANNEL_ID"),
     )
     return 0
 
