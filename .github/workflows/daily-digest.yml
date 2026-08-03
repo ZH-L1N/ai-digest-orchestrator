@@ -17,6 +17,8 @@ jobs:
   digest:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write  # keepalive step pushes to this repo
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -35,3 +37,17 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+      # GitHub disables `schedule:` workflows after 60 days with no push to THIS repo.
+      # run.py only ever commits to ai-daily-digest, so the orchestrator would go stale
+      # and get auto-disabled every 60 days. Push a timestamp to reset the clock.
+      # `always()` on purpose: a broken digest must not also silently kill the schedule.
+      # GITHUB_TOKEN pushes don't trigger workflows, so this can't recurse.
+      - name: Keepalive (reset 60-day inactivity clock)
+        if: always()
+        run: |
+          date -u +%Y-%m-%dT%H:%M:%SZ > .keepalive
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          git diff --staged --quiet || git commit -m "chore: keepalive $(date -u +%F)"
+          git push
