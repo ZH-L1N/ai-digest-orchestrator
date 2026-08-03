@@ -9,3 +9,8 @@ __pycache__/
 
 # Adversarial-review + workflow scratch
 .scratch/
+
+# Adversarial-review round sidecars: each embeds a full plan copy, so they
+# duplicate what git history already tracks. The rendered *-fixes.md is the
+# committed audit trail.
+plans/fixs/*-round-*.json
